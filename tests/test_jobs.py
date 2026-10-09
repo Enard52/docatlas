@@ -232,3 +232,11 @@ def test_profile_change_reingests_unchanged_bytes(tmp_path):
         db.execute("UPDATE documents SET extraction_profile='legacy'")
     assert store.ingest("notes.txt", content)["status"] == "updated"
     assert store.document(first["id"])["extraction_profile"] == "mixed-v2"
+
+
+def test_newer_schema_is_not_silently_downgraded(tmp_path):
+    store = Store(tmp_path)
+    with store.connect() as db:
+        db.execute("INSERT INTO schema_migrations VALUES (99,'future')")
+    with pytest.raises(ValueError, match="newer schema"):
+        Store(tmp_path)

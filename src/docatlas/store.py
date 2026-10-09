@@ -23,6 +23,16 @@ class Store:
         if self.path.exists():
             previous = sqlite3.connect(self.path)
             try:
+                if previous.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='schema_migrations'"
+                ).fetchone():
+                    version = previous.execute(
+                        "SELECT COALESCE(MAX(version),0) FROM schema_migrations"
+                    ).fetchone()[0]
+                    if version > 1:
+                        raise ValueError(
+                            "This workspace uses a newer schema. Upgrade DocAtlas before opening it."
+                        )
                 columns = {r[1] for r in previous.execute("PRAGMA table_info(documents)")}
                 if columns and "extraction_profile" not in columns:
                     backup_dir = directory / "backups"

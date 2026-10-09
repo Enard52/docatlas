@@ -495,7 +495,8 @@ def create_app(settings=None, encoder=None):
                 "SELECT COUNT(*) FROM chunks c LEFT JOIN search s ON s.chunk_id=c.id WHERE s.chunk_id IS NULL"
             ).fetchone()[0]
             states = dict(db.execute("SELECT state,COUNT(*) FROM ingestion_jobs GROUP BY state"))
-        healthy = integrity == "ok" and chunks == indexed and not missing
+        worker_running = bool(jobs.thread and jobs.thread.is_alive())
+        healthy = integrity == "ok" and chunks == indexed and not missing and worker_running
         return JSONResponse(
             {
                 "status": "ready" if healthy else "degraded",
@@ -504,6 +505,7 @@ def create_app(settings=None, encoder=None):
                 "indexed": indexed,
                 "missing_index_entries": missing,
                 "ingestion_jobs": states,
+                "ingestion_worker": "running" if worker_running else "stopped",
                 "model": "tested" if providers.public()["last_check"] else "untested",
                 "answer_quality": "not_certified",
             },
