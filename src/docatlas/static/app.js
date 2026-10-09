@@ -1,6 +1,7 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
-let currentOperation = null, askController = null;
+let currentOperation = null, askController = null, exportUrl = null;
+let jobSignature = "", pollingJobs = false;
 let apiKey = "", config = { modes: ["bm25"], generation: false }, documents = [];
 const modeNames = { bm25: "Keyword · BM25", dense: "Semantic · neural", hybrid: "Hybrid · fused" };
 
@@ -32,6 +33,7 @@ function changeView(view) {
   const names = { ask: "Ask your docs", library: "Document library", compare: "Compare retrieval", activity: "System activity", model: "Model setup" };
   $("breadcrumb").textContent = `Workspace / ${names[view]}`;
   notice("");
+  if (view === "library") loadJobs().catch(e => notice(e.message));
   if (view === "model") loadProvider().catch(e => notice(e.message));
   if (view === "activity") loadActivity().catch(e => notice(e.message));
 }
@@ -39,7 +41,7 @@ document.querySelectorAll("[data-view]").forEach(b => b.addEventListener("click"
 document.querySelectorAll("[data-go]").forEach(b => b.addEventListener("click", () => changeView(b.dataset.go)));
 $("settings-open").addEventListener("click", () => $("settings-dialog").showModal());
 $("settings-close").addEventListener("click", () => $("settings-dialog").close());
-$("source-close").addEventListener("click", () => $("source-dialog").close());
+$("source-close").addEventListener("click", () => {$("source-dialog").close(); if(exportUrl) {URL.revokeObjectURL(exportUrl); exportUrl = null;}});
 $("key-form").addEventListener("submit", async e => {
   e.preventDefault(); apiKey = $("api-key").value; $("api-key").value = "";
   $("settings-dialog").close(); await initialize();
@@ -74,10 +76,11 @@ async function loadLibrary() {
   const list = $("library-list"); list.replaceChildren();
   if (!documents.length) list.append(node("div", "Your library is ready. Add a document above to make it searchable.", "empty-state"));
   for (const doc of documents) {
-    const row = node("article", undefined, "document-row");
+    const row = node("article", undefined, "document-row"); row.dataset.filename = doc.filename.toLowerCase();
     row.append(node("span", doc.filename.split(".").pop().toUpperCase().slice(0, 5), "file-icon"));
     const info = node("div", undefined, "document-info");
     info.append(node("h3", doc.filename), node("p", `${doc.chunks} passages · ${(doc.byte_size / 1024).toFixed(1)} KB · updated ${new Date(doc.updated_at).toLocaleDateString()}`));
+    for (const warning of doc.warnings || []) info.append(node("p", warning, "notice"));
     const actions = node("div", undefined, "row-actions");
     const inspect = node("button", "Inspect ↗", "text-button"); inspect.addEventListener("click", () => openSource(doc.id));
     const remove = node("button", "Remove", "delete-button");
@@ -89,7 +92,44 @@ async function loadLibrary() {
     });
     actions.append(inspect, remove); row.append(info, actions); list.append(row);
   }
+  filterLibrary();
 }
+
+function filterLibrary() {
+  const query = $("library-search").value.toLowerCase();
+  $("library-list").querySelectorAll(".document-row").forEach(row => row.hidden = !row.dataset.filename.includes(query));
+}
+$("library-search").addEventListener("input", filterLibrary);
+
+async function loadJobs() {
+  const {jobs} = await api("/api/ingestion/jobs");
+  const signature = JSON.stringify(jobs);
+  if (signature === jobSignature) return;
+  jobSignature = signature;
+  const list = $("job-list"); list.replaceChildren();
+  if (!jobs.length) list.append(node("p", "No uploads queued.", "subtle"));
+  for (const job of jobs) {
+    const row = node("article", undefined, "document-row");
+    const info = node("div", undefined, "document-info");
+    info.append(node("h4", job.filename), node("p", `${job.state} · attempt ${job.attempts}${job.error ? ` · ${job.error}` : ""}`));
+    const actions = node("div", undefined, "row-actions");
+    if (!["ready", "failed", "cancelled"].includes(job.state)) {
+      const cancel = node("button", "Cancel upload", "secondary");
+      cancel.addEventListener("click", async () => {try {await api(`/api/ingestion/jobs/${job.id}`, {method:"DELETE"}); await loadJobs();} catch(e) {notice(e.message);}}); actions.append(cancel);
+    }
+    if (job.state === "failed" && job.error_code !== "invalid_document" && job.attempts < 3) {
+      const retry = node("button", "Retry", "secondary");
+      retry.addEventListener("click", async () => {try {await api(`/api/ingestion/jobs/${job.id}/retry`, {method:"POST"}); await loadJobs();} catch(e) {notice(e.message);}}); actions.append(retry);
+    }
+    row.append(info, actions); list.append(row);
+  }
+  await loadLibrary();
+}
+setInterval(async () => {
+  if (pollingJobs || document.hidden || $("view-library").hidden) return;
+  pollingJobs = true;
+  try {await loadJobs();} catch(e) {notice(e.message);} finally {pollingJobs = false;}
+}, 5000);
 
 $("upload-form").addEventListener("submit", async e => {
   e.preventDefault(); notice("");
@@ -99,14 +139,14 @@ $("upload-form").addEventListener("submit", async e => {
   const outcomes = [];
   try {
     for (const file of files) {
-      $("upload-status").textContent = `Indexing ${file.name}…`;
+      $("upload-status").textContent = `Uploading ${file.name}…`;
       if (file.size > config.max_upload_mb * 1024 * 1024) { outcomes.push(`${file.name}: exceeds upload limit`); continue; }
       const form = new FormData(); form.append("file", file); form.append("source", $("source-url").value);
-      try { const result = await api("/api/documents", { method: "POST", body: form }); outcomes.push(`${file.name}: ${result.status}`); }
+      try { const result = await api("/api/ingestion/jobs", { method: "POST", body: form }); outcomes.push(`${file.name}: ${result.state}`); }
       catch (e) { outcomes.push(`${file.name}: ${e.message}`); }
     }
     $("upload-status").textContent = outcomes.join(" · ");
-    $("files").value = ""; $("source-url").value = ""; await loadLibrary();
+    $("files").value = ""; $("source-url").value = ""; await loadJobs();
   } catch (e) { notice(e.message); }
   finally { $("upload-button").disabled = false; }
 });
@@ -119,6 +159,7 @@ async function openSource(id) {
     if (/^https?:\/\//.test(doc.source)) {
       const link = node("a", "Open original source ↗", "source-link"); link.href = doc.source; link.target = "_blank"; link.rel = "noopener noreferrer"; content.append(link);
     }
+    for (const warning of doc.warnings || []) content.append(node("p", warning, "notice"));
     for (const passage of doc.passages) {
       const article = node("article", undefined, "passage");
       article.append(node("h3", `${passage.section}${passage.page ? ` · page ${passage.page}` : ""}`), node("pre", passage.text)); content.append(article);
@@ -137,11 +178,12 @@ function evidenceCard(hit, index) {
 
 $("ask-form").addEventListener("submit", async e => {
   e.preventDefault(); notice("");
+  const askedQuestion = $("question").value;
   $("ask-button").disabled = true; $("ask-empty").hidden = true;
   currentOperation = crypto.randomUUID(); askController = new AbortController(); $("cancel-ask").hidden = false;
   const region = $("answer-region"); region.replaceChildren(node("div", "Searching your documentation…", "loading"));
   try {
-    const data = await api("/api/ask", { method: "POST", signal: askController.signal, headers: {"Content-Type": "application/json"}, body: JSON.stringify({ question: $("question").value, mode: $("mode").value, document_id: $("doc-filter").value || null, operation_id: currentOperation }) });
+    const data = await api("/api/ask", { method: "POST", signal: askController.signal, headers: {"Content-Type": "application/json"}, body: JSON.stringify({ question: askedQuestion, mode: $("mode").value, answer_style: $("answer-style").value, document_id: $("doc-filter").value || null, operation_id: currentOperation }) });
     region.replaceChildren(); const card = node("article", undefined, "answer-card");
     const label = node("div", undefined, "answer-label"); label.append(node("span", data.status === "answered" ? "Draft answer · quotes checked" : data.status.replaceAll("_", " ")), node("span", `${data.latency_ms} ms · ${data.mode}`));
     card.append(label, node("p", data.message, "answer-status"));
@@ -160,7 +202,21 @@ $("ask-form").addEventListener("submit", async e => {
         catch (e) { notice(e.message); }
       }); feedback.append(button);
     }
-    card.append(feedback); region.append(card);
+    const exportButton = node("button", "Export answer and sources", "secondary");
+    exportButton.addEventListener("click", () => {
+      const lines = ["# DocAtlas response", "", `Question: ${askedQuestion}`, "", `Status: ${data.status}`, `Configured provider: ${data.provider?.kind || "none"} / ${data.provider?.model || "none"}`, "", data.message, ""];
+      for (const claim of data.claims) lines.push(claim.text, "", ...claim.quote.split("\n").map(line => `> ${line}`), "");
+      lines.push("## Retrieved sources", "");
+      for (const hit of data.hits) lines.push(`### ${hit.filename} — ${hit.section}${hit.page ? `, page ${hit.page}` : ""}`, hit.source || "", "", ...hit.text.split("\n").map(line => `> ${line}`), "");
+      if(exportUrl) URL.revokeObjectURL(exportUrl);
+      exportUrl = URL.createObjectURL(new Blob([lines.join("\n")], {type:"text/markdown;charset=utf-8"}));
+      $("source-title").textContent = "Export response";
+      const preview = node("textarea"); preview.value = lines.join("\n"); preview.readOnly = true; preview.rows = 18; preview.className = "export-preview"; preview.setAttribute("aria-label", "Markdown response");
+      const link = node("a", "Download Markdown", "source-link"); link.href = exportUrl; link.download = "docatlas-response.md";
+      $("source-content").replaceChildren(node("p", "Copy the Markdown below, or download it in a browser that supports file downloads.", "subtle"), preview, link);
+      $("source-dialog").showModal();
+    });
+    card.append(feedback, exportButton); region.append(card);
     region.append(node("div", `RETRIEVED EVIDENCE · ${data.hits.length} PASSAGES`, "evidence-heading"));
     data.hits.forEach((hit, i) => region.append(evidenceCard(hit, i)));
   } catch (e) { region.replaceChildren(node("div", e.name === "AbortError" ? "Question cancelled. The model server may finish work already dispatched." : e.message, "notice")); }
