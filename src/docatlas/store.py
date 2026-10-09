@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -11,7 +12,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .ingest import chunk_document, extract
+from .ingest import EXTRACTION_PROFILE, chunk_document, extract
 from .retrieval import reciprocal_rank_fusion
 
 
@@ -19,6 +20,24 @@ class Store:
     def __init__(self, directory: Path, encoder=None):
         directory.mkdir(parents=True, exist_ok=True)
         self.path = directory / "docatlas.sqlite3"
+        if self.path.exists():
+            previous = sqlite3.connect(self.path)
+            try:
+                columns = {r[1] for r in previous.execute("PRAGMA table_info(documents)")}
+                if columns and "extraction_profile" not in columns:
+                    backup_dir = directory / "backups"
+                    backup_dir.mkdir(mode=0o700, exist_ok=True)
+                    backup_path = backup_dir / "pre-mixed-v2.sqlite3"
+                    if not backup_path.exists():
+                        fd = os.open(backup_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                        os.close(fd)
+                        target = sqlite3.connect(backup_path)
+                        try:
+                            previous.backup(target)
+                        finally:
+                            target.close()
+            finally:
+                previous.close()
         self.encoder = encoder
         self._writer = threading.Lock()
         with self.connect() as db:
@@ -44,6 +63,20 @@ class Store:
                     note TEXT NOT NULL, created_at TEXT NOT NULL
                 );
             """)
+            columns = {r[1] for r in db.execute("PRAGMA table_info(documents)")}
+            for name, definition in [
+                ("extraction_profile", "TEXT NOT NULL DEFAULT 'legacy'"),
+                ("warnings", "TEXT NOT NULL DEFAULT '[]'"),
+            ]:
+                if name not in columns:
+                    db.execute(f"ALTER TABLE documents ADD COLUMN {name} {definition}")
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+            )
+            db.execute(
+                "INSERT OR IGNORE INTO schema_migrations VALUES (1,?)",
+                (datetime.now(UTC).isoformat(),),
+            )
 
     @contextmanager
     def connect(self):
@@ -56,7 +89,8 @@ class Store:
         finally:
             db.close()
 
-    def ingest(self, filename: str, content: bytes, source: str = ""):
+    def ingest(self, filename: str, content: bytes, source: str = "", progress=None, job_id=None):
+        progress = progress or (lambda stage: None)
         filename = Path(filename.replace("\\", "/")).name[:200]
         if not filename:
             raise ValueError("A filename is required.")
@@ -76,11 +110,31 @@ class Store:
                 and existing["digest"] == digest
                 and existing["embedding_model"] == model
                 and existing["source"] == source
+                and existing["extraction_profile"] == EXTRACTION_PROFILE
             ):
-                return {"id": document_id, "status": "unchanged"}
-            chunks = chunk_document(document_id, extract(filename, content))
+                result = {"id": document_id, "status": "unchanged"}
+                if job_id:
+                    with self.connect() as db:
+                        self._finish_job(db, job_id, result)
+                return result
+            warnings = []
+            progress("extracting")
+            pages = extract(filename, content, warnings=warnings)
+            progress("chunking")
+            chunks = chunk_document(document_id, pages)
+            progress("embedding")
             vectors = self.encoder.documents([c.text for c in chunks]) if self.encoder else None
+            progress("committing")
+            result = {
+                "id": document_id,
+                "status": "updated" if existing else "created",
+                "chunks": len(chunks),
+                "warnings": warnings,
+            }
             with self.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                if job_id:
+                    self._finish_job(db, job_id, result)
                 # One transaction removes old chunks, stores new chunks and updates FTS.
                 db.execute(
                     "DELETE FROM search WHERE chunk_id IN (SELECT id FROM chunks WHERE document_id=?)",
@@ -88,7 +142,7 @@ class Store:
                 )
                 db.execute("DELETE FROM documents WHERE id=?", (document_id,))
                 db.execute(
-                    "INSERT INTO documents VALUES (?,?,?,?,?,?,?)",
+                    "INSERT INTO documents (id,filename,digest,source,updated_at,byte_size,embedding_model,extraction_profile,warnings) VALUES (?,?,?,?,?,?,?,?,?)",
                     (
                         document_id,
                         filename,
@@ -97,6 +151,8 @@ class Store:
                         datetime.now(UTC).isoformat(),
                         len(content),
                         model,
+                        EXTRACTION_PROFILE,
+                        json.dumps(warnings),
                     ),
                 )
                 for i, chunk in enumerate(chunks):
@@ -116,16 +172,28 @@ class Store:
                         ),
                     )
                     db.execute("INSERT INTO search VALUES (?,?)", (chunk.id, chunk.text))
-            return {
-                "id": document_id,
-                "status": "updated" if existing else "created",
-                "chunks": len(chunks),
-            }
+            return result
+
+    def _finish_job(self, db, job_id, result):
+        changed = db.execute(
+            "UPDATE ingestion_jobs SET state='ready',result=?,updated_at=? WHERE id=? AND state NOT IN ('cancelled','failed','ready')",
+            (json.dumps(result), datetime.now(UTC).isoformat(), job_id),
+        ).rowcount
+        if not changed:
+            raise ValueError("Ingestion was cancelled before commit.")
+
+    def backup(self, destination):
+        with self.connect() as source:
+            target = sqlite3.connect(destination)
+            try:
+                source.backup(target)
+            finally:
+                target.close()
 
     def list_documents(self):
         with self.connect() as db:
             return [
-                dict(row)
+                {**dict(row), "warnings": json.loads(row["warnings"])}
                 for row in db.execute("""
                 SELECT d.*, COUNT(c.id) AS chunks FROM documents d
                 LEFT JOIN chunks c ON c.document_id=d.id GROUP BY d.id ORDER BY d.filename
@@ -139,6 +207,7 @@ class Store:
                 return None
             return {
                 **dict(doc),
+                "warnings": json.loads(doc["warnings"]),
                 "passages": [
                     dict(c)
                     for c in db.execute(
@@ -168,6 +237,28 @@ class Store:
             return []
         query = " OR ".join('"' + token + '"' for token in tokens)
         limit = max(k * 4, 30)
+        if mode == "bm25":
+            # Fetch only ranked matches, never the complete library or vector blobs.
+            with self.connect() as db:
+                rows = db.execute(
+                    "SELECT c.id,c.document_id,c.text,c.section,c.page,c.ordinal,d.filename,d.source,bm25(search) AS rank FROM search JOIN chunks c ON c.id=search.chunk_id JOIN documents d ON d.id=c.document_id WHERE search MATCH ?"
+                    + (" AND c.document_id=?" if document_id else "")
+                    + " ORDER BY rank,c.id LIMIT ?",
+                    (query, *((document_id,) if document_id else ()), k),
+                ).fetchall()
+            results = []
+            for index, row in enumerate(rows, 1):
+                value = dict(row)
+                rank = value.pop("rank")
+                results.append(
+                    {
+                        **value,
+                        "score": round(1 / (60 + index), 6),
+                        "bm25_score": -rank,
+                        "dense_score": None,
+                    }
+                )
+            return results
         with self.connect() as db:
             # Keep all reads on one snapshot across simultaneous ingestion/deletion.
             db.execute("BEGIN")
@@ -244,5 +335,5 @@ class Store:
 
     def fingerprint(self):
         docs = self.list_documents()
-        data = [(d["id"], d["digest"], d["embedding_model"]) for d in docs]
+        data = [(d["id"], d["digest"], d["embedding_model"], d["extraction_profile"]) for d in docs]
         return hashlib.sha256(json.dumps(data).encode()).hexdigest()[:16]

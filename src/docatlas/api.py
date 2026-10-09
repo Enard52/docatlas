@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 
 from .answer import ModelAbstention, ProviderError, answer_async, generate_async
 from .config import Settings
+from .jobs import JobQueue
 from .providers import ProviderFailure, ProviderInput, ProviderManager
 from .retrieval import LocalEncoder
 from .store import Store
@@ -31,6 +32,7 @@ class Query(BaseModel):
     mode: Literal["bm25", "dense", "hybrid"] = "bm25"
     k: int = Field(default=6, ge=1, le=15)
     operation_id: uuid.UUID | None = None
+    answer_style: Literal["evidence", "draft"] = "draft"
     document_id: str | None = Field(default=None, max_length=64)
 
 
@@ -47,9 +49,25 @@ def create_app(settings=None, encoder=None):
     if settings.embeddings == "fastembed" and encoder is None:
         encoder = LocalEncoder(settings.embedding_model, settings.data_dir / "models")
     store = Store(settings.data_dir, encoder)
+    jobs = JobQueue(store, settings)
+
+    @asynccontextmanager
+    async def lifespan(app):
+        jobs.start()
+        try:
+            yield
+        finally:
+            await asyncio.to_thread(jobs.close)
+
     app = FastAPI(
-        title="DocAtlas", version="1.0.0", docs_url=None, redoc_url=None, openapi_url=None
+        title="DocAtlas",
+        version="1.0.0",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+        lifespan=lifespan,
     )
+    app.state.jobs = jobs
     app.state.store = store
     app.state.settings = settings
     providers = ProviderManager(settings)
@@ -132,7 +150,7 @@ def create_app(settings=None, encoder=None):
                     )
             raw_length = request.headers.get("content-length", "0")
             if (
-                request.url.path == "/api/documents"
+                request.url.path in {"/api/documents", "/api/ingestion/jobs"}
                 and request.method == "POST"
                 and "content-length" not in request.headers
             ):
@@ -322,8 +340,54 @@ def create_app(settings=None, encoder=None):
             except ValueError as exc:
                 raise HTTPException(422, str(exc)) from exc
 
+    @app.post("/api/ingestion/jobs", status_code=202)
+    async def enqueue(file: Annotated[UploadFile, File()], source: Annotated[str, Form()] = ""):
+        limit = settings.max_upload_mb * 1024 * 1024
+        try:
+            data = bytearray()
+            while part := await file.read(min(65536, limit + 1 - len(data))):
+                data.extend(part)
+                if len(data) > limit:
+                    raise HTTPException(413, "File exceeds the upload limit.")
+            return await asyncio.to_thread(jobs.submit, file.filename or "", bytes(data), source)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        finally:
+            await file.close()
+
+    @app.get("/api/ingestion/jobs")
+    def ingestion_jobs():
+        return {"jobs": jobs.list()}
+
+    @app.get("/api/ingestion/jobs/{job_id}")
+    def ingestion_job(job_id: uuid.UUID):
+        job = jobs.get(str(job_id))
+        if not job:
+            raise HTTPException(404, "Ingestion job not found.")
+        return job
+
+    @app.delete("/api/ingestion/jobs/{job_id}")
+    def cancel_ingestion(job_id: uuid.UUID):
+        if not jobs.get(str(job_id)):
+            raise HTTPException(404, "Ingestion job not found.")
+        if not jobs.cancel(str(job_id)):
+            raise HTTPException(409, "This job has already finished.")
+        return {"status": "cancellation_requested"}
+
+    @app.post("/api/ingestion/jobs/{job_id}/retry")
+    def retry_ingestion(job_id: uuid.UUID):
+        try:
+            return jobs.retry(str(job_id))
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
     @app.delete("/api/documents/{document_id}")
     def delete(document_id: str):
+        existing = store.document(document_id)
+        if existing:
+            for job in jobs.list():
+                if job["filename"] == existing["filename"]:
+                    jobs.cancel(job["id"])
         if not store.delete(document_id):
             raise HTTPException(404, "Document not found.")
         return {"status": "deleted"}
@@ -361,7 +425,14 @@ def create_app(settings=None, encoder=None):
                 hits = await asyncio.to_thread(run_search, query)
                 try:
                     result = await asyncio.wait_for(
-                        answer_async(query.question, hits, snapshot), timeout=snapshot.llm_timeout
+                        answer_async(
+                            query.question,
+                            hits,
+                            replace(snapshot, llm_url="", llm_model="")
+                            if query.answer_style == "evidence"
+                            else snapshot,
+                        ),
+                        timeout=snapshot.llm_timeout,
                     )
                 except TimeoutError:
                     result = {
@@ -371,6 +442,8 @@ def create_app(settings=None, encoder=None):
                         "claims": [],
                         "usage": {},
                     }
+                if query.answer_style == "evidence" and result["status"] == "evidence_only":
+                    result["message"] = "Source excerpts selected. No generation model was called."
                 return hits, result
 
         task = asyncio.create_task(execute())
@@ -411,6 +484,31 @@ def create_app(settings=None, encoder=None):
     def feedback(value: Feedback):
         store.save_feedback(str(value.request_id), value.helpful, value.note)
         return {"status": "saved"}
+
+    @app.get("/api/readiness")
+    def readiness():
+        with store.connect() as db:
+            integrity = db.execute("PRAGMA quick_check").fetchone()[0]
+            chunks = db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+            indexed = db.execute("SELECT COUNT(*) FROM search").fetchone()[0]
+            missing = db.execute(
+                "SELECT COUNT(*) FROM chunks c LEFT JOIN search s ON s.chunk_id=c.id WHERE s.chunk_id IS NULL"
+            ).fetchone()[0]
+            states = dict(db.execute("SELECT state,COUNT(*) FROM ingestion_jobs GROUP BY state"))
+        healthy = integrity == "ok" and chunks == indexed and not missing
+        return JSONResponse(
+            {
+                "status": "ready" if healthy else "degraded",
+                "database": integrity,
+                "chunks": chunks,
+                "indexed": indexed,
+                "missing_index_entries": missing,
+                "ingestion_jobs": states,
+                "model": "tested" if providers.public()["last_check"] else "untested",
+                "answer_quality": "not_certified",
+            },
+            status_code=200 if healthy else 503,
+        )
 
     @app.get("/api/metrics")
     def metrics():

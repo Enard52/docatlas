@@ -3,13 +3,16 @@
 import hashlib
 import io
 import re
+import zipfile
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
+from xml.etree import ElementTree
 
 from pypdf import PdfReader
 
-SUPPORTED = {".md", ".markdown", ".txt", ".html", ".htm", ".pdf"}
+SUPPORTED = {".md", ".markdown", ".txt", ".html", ".htm", ".pdf", ".docx"}
+EXTRACTION_PROFILE = "mixed-v2"
 MAX_CHARACTERS = 2_000_000
 MAX_CHUNKS = 4000
 
@@ -44,11 +47,20 @@ class VisibleHTML(HTMLParser):
             self.parts.append(data)
 
 
-def extract(filename: str, content: bytes) -> list[tuple[int | None, str]]:
+def extract(filename: str, content: bytes, warnings=None) -> list[tuple[int | None, str]]:
+    warnings = warnings if warnings is not None else []
     suffix = Path(filename).suffix.lower()
     if suffix not in SUPPORTED:
-        raise ValueError("Supported files: Markdown, TXT, HTML and text-based PDF.")
-    if suffix == ".pdf":
+        raise ValueError("Supported files: Markdown, TXT, HTML, DOCX and text-based PDF.")
+    if suffix == ".docx":
+        warnings.append(
+            "DOCX tables are flattened by row; verify merged cells, footnotes and figures in the original."
+        )
+        pages = [(None, extract_docx(content))]
+    elif suffix == ".pdf":
+        warnings.append(
+            "PDF text order and tables may differ from the original layout; inspect the original for numerical claims."
+        )
         try:
             reader = PdfReader(io.BytesIO(content))
             if reader.is_encrypted or len(reader.pages) > 300:
@@ -60,6 +72,10 @@ def extract(filename: str, content: bytes) -> list[tuple[int | None, str]]:
                 total += len(value)
                 if total > MAX_CHARACTERS:
                     raise ValueError("Extracted text is too large.")
+                if len(value.strip()) < 30:
+                    warnings.append(
+                        f"Page {i + 1} has little or no extractable text; OCR or source inspection is needed."
+                    )
                 pages.append((i + 1, value))
         except ValueError:
             raise
@@ -80,6 +96,49 @@ def extract(filename: str, content: bytes) -> list[tuple[int | None, str]]:
     if not any(text.strip() for _, text in pages):
         raise ValueError("No extractable text. Scanned PDFs require OCR before upload.")
     return pages
+
+
+def extract_docx(content):
+    """Bound ZIP expansion and parse paragraphs/tables without external entities."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            entries = archive.infolist()
+            if len(entries) > 2000 or sum(e.file_size for e in entries) > 20_000_000:
+                raise ValueError("DOCX archive exceeds extraction limits.")
+            if any(e.flag_bits & 1 for e in entries):
+                raise ValueError("Encrypted DOCX files are unsupported.")
+            info = archive.getinfo("word/document.xml")
+            if info.file_size > 8_000_000:
+                raise ValueError("DOCX document XML is too large.")
+            data = archive.read(info)
+        if b"<!DOCTYPE" in data.upper() or b"<!ENTITY" in data.upper():
+            raise ValueError("DOCX XML entity declarations are unsupported.")
+        root = ElementTree.fromstring(data)
+        namespace = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+        body = root.find(namespace + "body")
+        if body is None:
+            raise ValueError("DOCX has no document body.")
+
+        def text(element):
+            return "".join(t.text or "" for t in element.iter(namespace + "t"))
+
+        parts = []
+        for element in body:
+            if element.tag == namespace + "p":
+                value = text(element)
+                style = element.find(".//" + namespace + "pStyle")
+                if style is not None and "heading" in style.get(namespace + "val", "").lower():
+                    value = "# " + value
+                parts.append(value)
+            elif element.tag == namespace + "tbl":
+                parts.append("[Table: cells separated by |; verify merged cells in the original]")
+                for row in element.findall(namespace + "tr"):
+                    parts.append(" | ".join(text(cell) for cell in row.findall(namespace + "tc")))
+        return "\n".join(parts)
+    except ValueError:
+        raise
+    except (zipfile.BadZipFile, KeyError, ElementTree.ParseError, RuntimeError, OSError) as exc:
+        raise ValueError("Unable to extract this DOCX. Use an unencrypted .docx file.") from exc
 
 
 def chunk_document(document_id: str, pages, size: int = 1200, overlap: int = 180):
