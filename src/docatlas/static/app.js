@@ -1,5 +1,6 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
+let currentOperation = null, askController = null;
 let apiKey = "", config = { modes: ["bm25"], generation: false }, documents = [];
 const modeNames = { bm25: "Keyword · BM25", dense: "Semantic · neural", hybrid: "Hybrid · fused" };
 
@@ -16,7 +17,7 @@ async function api(path, options = {}) {
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     if (response.status === 401 && !$("settings-dialog").open) $("settings-dialog").showModal();
-    throw new Error(typeof data.detail === "string" ? data.detail : `Request failed (${response.status}).`);
+    throw new Error(typeof data.detail === "string" ? data.detail : Array.isArray(data.detail) ? data.detail.map(e => e.msg).join("; ") : `Request failed (${response.status}).`);
   }
   return data;
 }
@@ -28,9 +29,10 @@ function changeView(view) {
     button.classList.toggle("active", active);
     if (active) button.setAttribute("aria-current", "page"); else button.removeAttribute("aria-current");
   }
-  const names = { ask: "Ask your docs", library: "Document library", compare: "Compare retrieval", activity: "System activity" };
+  const names = { ask: "Ask your docs", library: "Document library", compare: "Compare retrieval", activity: "System activity", model: "Model setup" };
   $("breadcrumb").textContent = `Workspace / ${names[view]}`;
   notice("");
+  if (view === "model") loadProvider().catch(e => notice(e.message));
   if (view === "activity") loadActivity().catch(e => notice(e.message));
 }
 document.querySelectorAll("[data-view]").forEach(b => b.addEventListener("click", () => changeView(b.dataset.view)));
@@ -50,7 +52,8 @@ async function initialize() {
       const option = node("option", modeNames[mode]); option.value = mode; return option;
     }));
     $("mode").value = config.default_mode;
-    $("connection").textContent = config.generation ? "Model connected" : "Evidence mode";
+    $("connection").textContent = config.provider?.last_check?.status === "ready" ? "Model tested" : config.generation ? "Model configured · untested" : "Evidence mode";
+    $("privacy-label").textContent = config.provider?.privacy === "remote" ? "◈ Remote model · sends passages" : "◈ Local workspace";
     $("compare-hint").textContent = config.modes.length === 1 ? "Keyword retrieval is enabled. Install the semantic extra, enable fastembed, and re-index to compare neural and hybrid retrieval." : "Compare the same corpus using BM25 keywords, neural embeddings, and reciprocal rank fusion. Evaluation datasets and regression gates are available through the CLI.";
     await loadLibrary(); notice("");
   } catch (e) { $("connection").textContent = "Connection required"; notice(e.message); }
@@ -135,11 +138,12 @@ function evidenceCard(hit, index) {
 $("ask-form").addEventListener("submit", async e => {
   e.preventDefault(); notice("");
   $("ask-button").disabled = true; $("ask-empty").hidden = true;
+  currentOperation = crypto.randomUUID(); askController = new AbortController(); $("cancel-ask").hidden = false;
   const region = $("answer-region"); region.replaceChildren(node("div", "Searching your documentation…", "loading"));
   try {
-    const data = await post("/api/ask", { question: $("question").value, mode: $("mode").value, document_id: $("doc-filter").value || null });
+    const data = await api("/api/ask", { method: "POST", signal: askController.signal, headers: {"Content-Type": "application/json"}, body: JSON.stringify({ question: $("question").value, mode: $("mode").value, document_id: $("doc-filter").value || null, operation_id: currentOperation }) });
     region.replaceChildren(); const card = node("article", undefined, "answer-card");
-    const label = node("div", undefined, "answer-label"); label.append(node("span", data.status.replaceAll("_", " ")), node("span", `${data.latency_ms} ms · ${data.mode}`));
+    const label = node("div", undefined, "answer-label"); label.append(node("span", data.status === "answered" ? "Draft answer · quotes checked" : data.status.replaceAll("_", " ")), node("span", `${data.latency_ms} ms · ${data.mode}`));
     card.append(label, node("p", data.message, "answer-status"));
     for (const claim of data.claims) {
       const paragraph = node("div", claim.text, "claim");
@@ -159,8 +163,8 @@ $("ask-form").addEventListener("submit", async e => {
     card.append(feedback); region.append(card);
     region.append(node("div", `RETRIEVED EVIDENCE · ${data.hits.length} PASSAGES`, "evidence-heading"));
     data.hits.forEach((hit, i) => region.append(evidenceCard(hit, i)));
-  } catch (e) { region.replaceChildren(node("div", e.message, "notice")); }
-  finally { $("ask-button").disabled = false; }
+  } catch (e) { region.replaceChildren(node("div", e.name === "AbortError" ? "Question cancelled. The model server may finish work already dispatched." : e.message, "notice")); }
+  finally { $("ask-button").disabled = false; $("cancel-ask").hidden = true; currentOperation = null; askController = null; }
 });
 
 $("compare-form").addEventListener("submit", async e => {
@@ -193,3 +197,72 @@ async function loadActivity() {
 }
 $("refresh-activity").addEventListener("click", () => loadActivity().catch(e => notice(e.message)));
 initialize();
+
+
+$("cancel-ask").addEventListener("click", async () => {
+  if (!currentOperation) return;
+  $("cancel-ask").disabled = true;
+  try {
+    await api(`/api/requests/${currentOperation}`, {method: "DELETE"});
+    askController?.abort();
+  } catch (e) { notice(e.message); }
+  finally { $("cancel-ask").disabled = false; }
+});
+
+function providerValue() {
+  const value = {
+    kind: $("provider-kind").value, base_url: $("provider-url").value,
+    model: $("provider-model").value, response_format: $("provider-format").value,
+    timeout_seconds: Number($("provider-timeout").value), context_tokens: Number($("provider-context").value),
+    max_output_tokens: Number($("provider-output").value), clear_key: $("provider-clear-key").checked,
+  };
+  if ($("provider-key").value) value.api_key = $("provider-key").value;
+  return value;
+}
+function providerPrivacy() {
+  const kind = $("provider-kind").value;
+  $("provider-fields").hidden = kind === "disabled";
+  $("provider-fields").querySelectorAll("input, select").forEach(el => el.disabled = kind === "disabled");
+  $("provider-check").disabled = kind === "disabled";
+  $("provider-privacy").textContent = kind === "api" ? "Your questions and selected document passages will be sent to this provider. Use an HTTPS endpoint you trust." : kind === "lmstudio" ? "Questions and passages go to your local LM Studio server. No external API fallback is used." : "Show retrieved passages without calling a generation model.";
+}
+$("provider-kind").addEventListener("change", () => {
+  if ($("provider-kind").value === "lmstudio") $("provider-url").value = "http://127.0.0.1:1234/v1";
+  if ($("provider-kind").value === "api" && $("provider-url").value.includes("127.0.0.1")) $("provider-url").value = "";
+  $("provider-key").value = ""; providerPrivacy();
+});
+async function loadProvider() {
+  const p = await api("/api/provider");
+  $("provider-kind").value = p.kind; $("provider-url").value = p.base_url; $("provider-model").value = p.model;
+  $("provider-format").value = p.response_format; $("provider-timeout").value = p.timeout_seconds;
+  $("provider-context").value = p.context_tokens; $("provider-output").value = p.max_output_tokens;
+  $("provider-key").value = ""; $("provider-clear-key").checked = false;
+  $("provider-key-state").textContent = p.key_configured ? "A provider key is saved. It is not shown here." : "No provider key saved.";
+  $("provider-status").textContent = p.last_check ? `${p.last_check.message} Last tested: ${new Date(p.last_check.checked_at).toLocaleString()}` : p.configured ? "Settings loaded. Test generation to check the model." : "Start LM Studio, discover models, choose a model, and save your settings.";
+  providerPrivacy();
+}
+async function providerAction(button, action) {
+  const controls = [$("provider-save"), $("provider-check"), $("discover-models")];
+  controls.forEach(b => b.disabled = true); $("provider-status").textContent = button === "provider-check" ? "Testing real model generation… This may take longer while the model loads." : "Connecting…";
+  try { await action(); }
+  catch (e) { $("provider-status").textContent = e.message; }
+  finally { controls.forEach(b => b.disabled = false); if ($("provider-kind").value === "disabled") $("provider-check").disabled = true; }
+}
+$("provider-form").addEventListener("submit", e => {
+  e.preventDefault();
+  providerAction("provider-save", async () => {
+    await api("/api/provider", {method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify(providerValue())});
+    $("provider-key").value = ""; await loadProvider(); await initialize();
+    $("provider-status").textContent = "Settings saved. Run Test generation to check the selected model.";
+  });
+});
+$("discover-models").addEventListener("click", () => providerAction("discover-models", async () => {
+  const data = await post("/api/provider/models", providerValue());
+  $("provider-models").replaceChildren(...data.models.map(id => {const option = node("option", id); option.value = id; return option;}));
+  $("provider-status").textContent = data.models.length ? `${data.models.length} models discovered. Choose a chat model in Model ID, save settings, then test generation.` : "No models found. Download and load a chat model in LM Studio.";
+}));
+$("provider-check").addEventListener("click", () => providerAction("provider-check", async () => {
+  const data = await post("/api/provider/check", providerValue());
+  $("provider-status").textContent = `${data.message} ${data.latency_ms} ms · ${data.model}`;
+  await initialize();
+}));

@@ -11,6 +11,11 @@ class Settings:
     llm_url: str = ""
     llm_model: str = ""
     llm_key: str = ""
+    llm_kind: str = "lmstudio"
+    llm_format: str = "json_schema"
+    llm_timeout: int = 120
+    llm_context_tokens: int = 8192
+    llm_max_tokens: int = 1400
     api_key: str = ""
     rate_limit: int = 60
     max_upload_mb: int = 10
@@ -25,6 +30,11 @@ class Settings:
             llm_url=os.getenv("DOCATLAS_LLM_URL", "").rstrip("/"),
             llm_model=os.getenv("DOCATLAS_LLM_MODEL", ""),
             llm_key=os.getenv("DOCATLAS_LLM_KEY", ""),
+            llm_kind=os.getenv("DOCATLAS_LLM_KIND", "lmstudio"),
+            llm_format=os.getenv("DOCATLAS_LLM_FORMAT", "json_schema"),
+            llm_timeout=int(os.getenv("DOCATLAS_LLM_TIMEOUT", "120")),
+            llm_context_tokens=int(os.getenv("DOCATLAS_LLM_CONTEXT_TOKENS", "8192")),
+            llm_max_tokens=int(os.getenv("DOCATLAS_LLM_MAX_TOKENS", "1400")),
             api_key=os.getenv("DOCATLAS_API_KEY", ""),
             rate_limit=max(1, int(os.getenv("DOCATLAS_RATE_LIMIT", "60"))),
             max_upload_mb=max(1, int(os.getenv("DOCATLAS_MAX_UPLOAD_MB", "10"))),

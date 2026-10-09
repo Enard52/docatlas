@@ -15,12 +15,13 @@
     <button class="nav active" data-view="ask" aria-current="page"><span>⌕</span>Ask your docs</button>
     <button class="nav" data-view="library"><span>▤</span>Document library <b id="nav-count">0</b></button>
     <button class="nav" data-view="compare"><span>⇄</span>Compare retrieval</button>
+    <button class="nav" data-view="model"><span>⚙</span>Model setup</button>
     <button class="nav" data-view="activity"><span>◷</span>System activity</button>
   </nav>
   <div class="sidebar-bottom"><span class="status-dot"></span><span id="connection">Connecting…</span><button id="settings-open" aria-label="Workspace access settings">⚙</button></div>
 </aside>
 <main id="main">
-  <header class="topbar"><span id="breadcrumb">Workspace <span>/</span> Ask your docs</span><span class="private-label">◈ Local workspace</span></header>
+  <header class="topbar"><span id="breadcrumb">Workspace <span>/</span> Ask your docs</span><span class="private-label" id="privacy-label">◈ Local workspace</span></header>
   <div id="notice" class="notice" role="status" hidden></div>
   <section id="view-ask" class="view">
     <div class="eyebrow">KNOWLEDGE, WITH RECEIPTS</div>
@@ -29,7 +30,7 @@
     <form id="ask-form" class="question-box">
       <label class="sr-only" for="question">Your question</label>
       <textarea id="question" rows="3" maxlength="2000" placeholder="How do I configure this project?" required minlength="2"></textarea>
-      <div class="question-controls"><div class="selects"><label><span class="sr-only">Retrieval method</span><select id="mode"><option value="bm25">Keyword search</option></select></label><label><span class="sr-only">Document filter</span><select id="doc-filter"><option value="">All documents</option></select></label></div><button class="primary" id="ask-button" type="submit">Find answers <span>↗</span></button></div>
+      <div class="question-controls"><div class="selects"><label><span class="sr-only">Retrieval method</span><select id="mode"><option value="bm25">Keyword search</option></select></label><label><span class="sr-only">Document filter</span><select id="doc-filter"><option value="">All documents</option></select></label></div><button class="secondary" id="cancel-ask" type="button" hidden>Cancel</button><button class="primary" id="ask-button" type="submit">Find answers <span>↗</span></button></div>
     </form>
     <div class="context-line"><span id="corpus-summary">Loading your library…</span><span>Evidence before confidence.</span></div>
     <div id="answer-region" aria-live="polite"></div>
@@ -45,6 +46,33 @@
     <form id="compare-form" class="compare-form"><label class="sr-only" for="compare-question">Comparison question</label><input id="compare-question" required minlength="2" maxlength="2000" placeholder="Which passages answer your question?"><button class="primary" id="compare-button">Compare ↗</button></form>
     <p id="compare-hint" class="hint"></p><div id="comparison" class="comparison" aria-live="polite"></div>
   </section>
+  <section id="view-model" class="view" hidden>
+    <div class="eyebrow">CONNECT YOUR MODEL</div><h2>Model setup</h2>
+    <p class="subtle">Use LM Studio on this computer, or connect an optional API provider. Changing providers never happens automatically.</p>
+    <form id="provider-form" class="provider-panel">
+      <label for="provider-kind">Answer provider</label><select id="provider-kind"><option value="lmstudio">LM Studio · local</option><option value="api">API provider · remote</option><option value="disabled">Evidence only</option></select>
+      <p id="provider-privacy" class="hint"></p>
+      <div id="provider-fields">
+        <label for="provider-url">Provider base URL</label><input id="provider-url" type="url" required value="http://127.0.0.1:1234/v1">
+        <label for="provider-key">Provider API key (optional for LM Studio)</label><input id="provider-key" type="password" autocomplete="off" placeholder="Leave blank to keep the saved key">
+        <label class="check-label"><input id="provider-clear-key" type="checkbox">Remove saved provider key</label><p id="provider-key-state" class="hint"></p>
+        <div class="provider-actions"><button id="discover-models" type="button" class="secondary">Discover models</button></div>
+        <label for="provider-model">Model ID</label><input id="provider-model" list="provider-models" maxlength="300" placeholder="Choose a discovered model or enter its exact ID"><datalist id="provider-models"></datalist>
+        <p class="hint">In LM Studio, load a chat model and start the local server. Model discovery may also list downloaded or embedding models; choose a chat model and test it.</p>
+        <details><summary>Model limits and response format</summary>
+          <div class="provider-limits">
+            <label>Loaded context size (tokens)<input id="provider-context" type="number" min="2048" max="131072" value="8192" required></label>
+            <label>Maximum output tokens<input id="provider-output" type="number" min="128" max="8192" value="1400" required></label>
+            <label>Timeout (seconds)<input id="provider-timeout" type="number" min="10" max="300" value="120" required></label>
+            <label>Response format<select id="provider-format"><option value="json_schema">JSON schema</option><option value="json_object">JSON object</option></select></label>
+          </div><p class="hint">Match context size to the model's loaded settings, rather than its advertised maximum. Try JSON object only if your provider rejects JSON schema.</p>
+        </details>
+      </div>
+      <div class="provider-actions"><button id="provider-save" class="primary">Save settings</button><button id="provider-check" type="button" class="secondary">Test generation</button></div>
+      <div id="provider-status" class="provider-status" role="status" aria-live="polite"></div>
+      <p class="hint">Saved provider keys stay in a private settings file on this computer and are never returned to the browser. Protect the data directory and its backups.</p>
+    </form>
+  </section>
   <section id="view-activity" class="view" hidden>
     <div class="section-heading"><div><div class="eyebrow">UNDER THE HOOD</div><h2>System activity</h2></div><button id="refresh-activity" class="secondary">Refresh</button></div>
     <p class="subtle">Process-local operational counters. Resets when the server restarts.</p><div id="activity-cards" class="activity-cards"></div><div id="activity-table"></div>
@@ -52,5 +80,5 @@
   <footer>DOCATLAS <span>Built for questions worth getting right.</span></footer>
 </main>
 <dialog id="source-dialog"><div class="dialog-heading"><h2 id="source-title">Source document</h2><button id="source-close" class="icon-button" aria-label="Close source">×</button></div><div id="source-content"></div></dialog>
-<dialog id="settings-dialog"><div class="dialog-heading"><h2>Workspace access</h2><button id="settings-close" class="icon-button" aria-label="Close settings">×</button></div><p>If this workspace requires an API key, enter it here. It stays in memory for this tab and is cleared on reload.</p><form id="key-form"><label for="api-key">Workspace API key</label><input id="api-key" type="password" autocomplete="off"><button class="primary">Connect</button></form><p class="hint">Model and embedding providers are configured on the server. Documents sent to a generation provider follow that provider’s privacy terms.</p></dialog>
+<dialog id="settings-dialog"><div class="dialog-heading"><h2>Workspace access</h2><button id="settings-close" class="icon-button" aria-label="Close settings">×</button></div><p>If this workspace requires an API key, enter it here. It stays in memory for this tab and is cleared on reload.</p><form id="key-form"><label for="api-key">Workspace API key</label><input id="api-key" type="password" autocomplete="off"><button class="primary">Connect</button></form><p class="hint">Use Model setup to connect a generation provider. Remote providers receive your question and selected document passages.</p></dialog>
 </body></html>

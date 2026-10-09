@@ -5,16 +5,21 @@ import threading
 import time
 import uuid
 from collections import Counter, deque
+from contextlib import asynccontextmanager
+from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .answer import answer
+from .answer import ModelAbstention, ProviderError, answer_async, generate_async
 from .config import Settings
+from .providers import ProviderFailure, ProviderInput, ProviderManager
 from .retrieval import LocalEncoder
 from .store import Store
 
@@ -25,6 +30,7 @@ class Query(BaseModel):
     question: str = Field(min_length=2, max_length=2000)
     mode: Literal["bm25", "dense", "hybrid"] = "bm25"
     k: int = Field(default=6, ge=1, le=15)
+    operation_id: uuid.UUID | None = None
     document_id: str | None = Field(default=None, max_length=64)
 
 
@@ -46,11 +52,48 @@ def create_app(settings=None, encoder=None):
     )
     app.state.store = store
     app.state.settings = settings
+    providers = ProviderManager(settings)
+    app.state.providers = providers
+    active_asks = {}
+    pending_work = 0
     counters = Counter()
     durations = deque(maxlen=1000)
     windows = {}
     state_lock = threading.Lock()
     work_slots = asyncio.Semaphore(4)
+
+    @asynccontextmanager
+    async def work_slot():
+        nonlocal pending_work
+        if pending_work >= 12:
+            raise HTTPException(
+                503, "Workspace is busy. Try again shortly.", headers={"Retry-After": "5"}
+            )
+        pending_work += 1
+        acquired = False
+        try:
+            try:
+                await asyncio.wait_for(work_slots.acquire(), timeout=15)
+                acquired = True
+            except TimeoutError as exc:
+                raise HTTPException(503, "Work queue timed out. Try again shortly.") from exc
+            yield
+        finally:
+            pending_work -= 1
+            if acquired:
+                work_slots.release()
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request, exc):
+        # Validation errors must not echo provider keys submitted in the request.
+        return JSONResponse(
+            {
+                "detail": [
+                    {"loc": e["loc"], "msg": e["msg"], "type": e["type"]} for e in exc.errors()
+                ]
+            },
+            status_code=422,
+        )
 
     @app.middleware("http")
     async def controls(request: Request, call_next):
@@ -136,10 +179,122 @@ def create_app(settings=None, encoder=None):
             "version": "1.0.0",
             "modes": ["bm25", "dense", "hybrid"] if encoder else ["bm25"],
             "default_mode": "hybrid" if encoder else "bm25",
-            "generation": bool(settings.llm_url and settings.llm_model),
+            "generation": providers.public()["configured"],
+            "provider": {
+                k: v
+                for k, v in providers.public().items()
+                if k in {"kind", "model", "configured", "last_check", "privacy"}
+            },
             "embedding_model": encoder.name if encoder else None,
             "max_upload_mb": settings.max_upload_mb,
         }
+
+    def owner_only(request):
+        # A shared library key is not authority to change a remote provider or read its settings.
+        # Configuration is restricted to a client connected directly from the local machine.
+        if request.url.hostname not in {"127.0.0.1", "localhost", "::1", "testserver", "test"}:
+            raise HTTPException(403, "Model setup requires a local hostname.")
+        if request.client and request.client.host not in {"127.0.0.1", "::1", "testclient"}:
+            raise HTTPException(403, "Model setup is available only from this computer.")
+
+    @app.get("/api/provider")
+    def provider_config(request: Request):
+        owner_only(request)
+        return providers.public()
+
+    @app.put("/api/provider")
+    def save_provider(value: ProviderInput, request: Request):
+        owner_only(request)
+        return providers.save(value)
+
+    @app.post("/api/provider/models")
+    async def provider_models(value: ProviderInput, request: Request):
+        owner_only(request)
+        try:
+            async with work_slot():
+                return {"models": await providers.models(value)}
+        except ProviderFailure as exc:
+            return JSONResponse({"detail": exc.message, "code": exc.code}, status_code=502)
+
+    @app.post("/api/provider/check")
+    async def provider_check(value: ProviderInput, request: Request):
+        owner_only(request)
+        value = providers.resolved(value)
+        if value.kind == "disabled" or not value.model:
+            raise HTTPException(422, "Select a model before testing generation.")
+        snapshot = replace(
+            settings,
+            llm_url=value.base_url,
+            llm_model=value.model,
+            llm_key=value.api_key or "",
+            llm_kind=value.kind,
+            llm_format=value.response_format,
+            llm_timeout=value.timeout_seconds,
+            llm_context_tokens=value.context_tokens,
+            llm_max_tokens=value.max_output_tokens,
+        )
+        probe = [
+            {
+                "id": "connection-probe",
+                "text": "The DocAtlas connection test uses the code word atlas-ready.",
+            }
+        ]
+        start = time.perf_counter()
+        try:
+            async with work_slot():
+                claims, usage = await asyncio.wait_for(
+                    generate_async(
+                        "What code word does the DocAtlas connection test use?", probe, snapshot
+                    ),
+                    timeout=value.timeout_seconds,
+                )
+            if not any("atlas-ready" in c["text"] for c in claims):
+                raise ProviderError(
+                    "The model did not answer the connection test correctly.", "probe_failed"
+                )
+            check = {
+                "status": "ready",
+                "model": value.model,
+                "latency_ms": round((time.perf_counter() - start) * 1000, 2),
+                "checked_at": datetime.now(UTC).isoformat(),
+                "message": "Live generation and citation-format checks passed. Answer quality still requires evaluation.",
+            }
+            with providers.lock:
+                current = providers.snapshot()
+                if (
+                    current.llm_url,
+                    current.llm_model,
+                    current.llm_format,
+                    current.llm_key,
+                    current.llm_timeout,
+                    current.llm_context_tokens,
+                    current.llm_max_tokens,
+                ) == (
+                    snapshot.llm_url,
+                    snapshot.llm_model,
+                    snapshot.llm_format,
+                    snapshot.llm_key,
+                    snapshot.llm_timeout,
+                    snapshot.llm_context_tokens,
+                    snapshot.llm_max_tokens,
+                ):
+                    providers.last_check = check
+            return {**check, "usage": usage}
+        except TimeoutError:
+            return JSONResponse(
+                {
+                    "detail": "The connection test timed out. Load the model and try again.",
+                    "code": "provider_timeout",
+                },
+                status_code=504,
+            )
+        except ProviderError as exc:
+            return JSONResponse({"detail": str(exc), "code": exc.code}, status_code=502)
+        except ModelAbstention:
+            return JSONResponse(
+                {"detail": "The model abstained on the connection test.", "code": "probe_failed"},
+                status_code=502,
+            )
 
     @app.get("/api/documents")
     def documents():
@@ -161,7 +316,7 @@ def create_app(settings=None, encoder=None):
             raise HTTPException(413, "File exceeds the upload limit.")
         if len(source) > 2000:
             raise HTTPException(422, "Source URL is too long.")
-        async with work_slots:
+        async with work_slot():
             try:
                 return await asyncio.to_thread(store.ingest, file.filename or "", data, source)
             except ValueError as exc:
@@ -184,7 +339,7 @@ def create_app(settings=None, encoder=None):
     @app.post("/api/search")
     async def search(query: Query, request: Request):
         start = time.perf_counter()
-        async with work_slots:
+        async with work_slot():
             hits = await asyncio.to_thread(run_search, query)
         return {
             "hits": hits,
@@ -196,18 +351,61 @@ def create_app(settings=None, encoder=None):
     @app.post("/api/ask")
     async def ask(query: Query, request: Request):
         start = time.perf_counter()
-        async with work_slots:
-            hits = await asyncio.to_thread(run_search, query)
-            result = await asyncio.to_thread(answer, query.question, hits, settings)
+        operation_id = str(query.operation_id or uuid.uuid4())
+        if operation_id in active_asks:
+            raise HTTPException(409, "This question is already running.")
+        snapshot = providers.snapshot()
+
+        async def execute():
+            async with work_slot():
+                hits = await asyncio.to_thread(run_search, query)
+                try:
+                    result = await asyncio.wait_for(
+                        answer_async(query.question, hits, snapshot), timeout=snapshot.llm_timeout
+                    )
+                except TimeoutError:
+                    result = {
+                        "status": "generation_unavailable",
+                        "error_code": "provider_timeout",
+                        "message": "The model timed out. Source passages remain available. Check Model setup.",
+                        "claims": [],
+                        "usage": {},
+                    }
+                return hits, result
+
+        task = asyncio.create_task(execute())
+        active_asks[operation_id] = task
+        try:
+            hits, result = await task
+        except asyncio.CancelledError:
+            return JSONResponse(
+                {
+                    "status": "cancelled",
+                    "message": "Request cancelled. The model server may finish work already dispatched.",
+                },
+                status_code=499,
+            )
+        finally:
+            active_asks.pop(operation_id, None)
         with state_lock:
             counters[result["status"]] += 1
         return {
             **result,
             "hits": hits,
             "mode": query.mode,
+            "operation_id": operation_id,
+            "provider": {"kind": snapshot.llm_kind, "model": snapshot.llm_model},
             "latency_ms": round((time.perf_counter() - start) * 1000, 2),
             "request_id": request.state.request_id,
         }
+
+    @app.delete("/api/requests/{operation_id}")
+    async def cancel_request(operation_id: uuid.UUID):
+        task = active_asks.get(str(operation_id))
+        if not task:
+            raise HTTPException(404, "The request has already finished or is not running.")
+        task.cancel()
+        return {"status": "cancellation_requested"}
 
     @app.post("/api/feedback", status_code=201)
     def feedback(value: Feedback):
