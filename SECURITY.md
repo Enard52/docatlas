@@ -28,3 +28,23 @@ Rotate the workspace key by updating the environment and restarting the server.
 
 Report security issues privately to the repository owner rather than uploading private
 documents, credentials or exploit results in a public issue.
+
+## Provider setup and local secrets
+
+Model configuration routes require a direct loopback client and local hostname,
+in addition to the workspace key when set. Provider settings are written atomically
+to ignored `data/provider.json` with mode 0600. A provider key is plaintext in that
+private file; protect the filesystem account and backup permissions. It is never
+returned by configuration or validation responses and does not transfer to a
+changed endpoint. This is not an encrypted secret vault.
+
+Provider calls do not follow redirects or ambient proxy configuration. Local mode
+restricts the hostname to loopback or Docker's host alias; remote mode requires
+HTTPS. Owner configuration is a trusted capability, not a general-purpose URL
+fetch endpoint. DNS/private-network egress controls are not a SaaS security boundary.
+Do not expose this single-user design as a multi-tenant service.
+
+Source/quote validation establishes that quoted text was supplied to the model.
+It does not establish semantic support, truth or immunity to prompt injection.
+Live local tests demonstrated unsupported claims with valid quotations. Generated
+responses are labeled drafts and need evidence inspection.

@@ -63,23 +63,43 @@ the development questions target text passages rather than omitted source snippe
 
 ## Connect a model
 
-Configure a trusted OpenAI-compatible **chat-completions** endpoint that accepts
-`response_format: {"type":"json_object"}`, `temperature`, and `max_tokens`:
+Open **Model setup** in the browser. For local generation:
+
+1. Open LM Studio, load a chat model, and start its local server on port 1234.
+2. Keep **Serve on Local Network** and CORS disabled for a local installation.
+3. Choose LM Studio, use `http://127.0.0.1:1234/v1`, and click **Discover models**.
+4. Select a chat model. Set context size to its **loaded** context, not its advertised
+   maximum. Adjust output tokens and timeout for your hardware.
+5. Save settings, then click **Test generation**. A passing test checks connection,
+   structured output, source IDs and quotations. It does not certify answer accuracy.
+
+An optional remote API provider requires a trusted HTTPS `/v1` endpoint supporting
+OpenAI-compatible chat completions and JSON schema or JSON object output. The screen
+explicitly labels remote transmission: questions and selected passages go to that
+provider. DocAtlas never silently switches providers. Provider keys are stored only
+server-side in `data/provider.json` with owner-only file permissions; this is a local
+plaintext secret, so protect that directory and backups. Model setup is restricted
+to direct localhost connections. The workspace access key is separate.
+
+Saved settings take precedence over environment settings. Before saving settings,
+`DOCATLAS_LLM_URL`, `DOCATLAS_LLM_MODEL`, and related variables may configure a provider.
+Set `DOCATLAS_LLM_KIND=api` for remote endpoints. To return to environment settings,
+stop the app and move `data/provider.json` to a private backup location.
+
+A live integration smoke run with the installed Mistral 7B model passed connection
+and structured-output checks, but exposed truncation and a semantically unsupported
+claim whose quotation was real. Those are quality failures, not proof of production
+readiness. See [live validation](docs/LIVE_PROVIDER_VALIDATION.md) and the
+[production work plan](docs/PRODUCTION_PLAN.md). Re-run locally with:
 
 ```bash
-export DOCATLAS_LLM_URL="http://127.0.0.1:11434/v1"
-export DOCATLAS_LLM_MODEL="your-installed-model"
-# For authenticated endpoints, set DOCATLAS_LLM_KEY in your shell or secret manager.
-docatlas serve
+python scripts/validate_local_provider.py --model YOUR_MODEL --context LOADED_CONTEXT
 ```
 
-The URL is the provider's base URL, without `/chat/completions`. A local Ollama server
-is one option; it is not bundled or installed automatically. Remote providers receive
-your question and selected passages. Model keys remain server-side. The browser's
-workspace key is a separate key used to protect your DocAtlas instance.
-
-No model credentials are included. Provider contracts, timeouts and citation rejection
-are tested with mock HTTP responses; a live generation provider is not yet validated.
+This uses public repository documentation in a temporary library. It does not alter
+user documents. Reports are written under ignored `data/`; `--configure` explicitly
+saves the tested provider. Its exit code checks integration only; manually review
+all claims and quotes for meaning before counting a quality pass.
 
 `.env.example` documents supported environment variables. The Python CLI reads the
 process environment; it does **not** automatically load `.env`. Docker Compose does.
