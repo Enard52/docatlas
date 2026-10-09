@@ -94,3 +94,41 @@ The abstention heuristic can mistake topical similarity for an answer, especiall
 personal or time-sensitive questions. Quote verification does not verify entailment.
 Text-based PDF extraction preserves page numbers but not layout; scanned PDFs need
 external OCR. This release has no automatic reranker, OCR or graph index.
+
+## Durable browser uploads
+
+The browser uses `POST /api/ingestion/jobs` (multipart file/source) and receives 202
+with a persistent job ID. List jobs with `GET /api/ingestion/jobs`, read one with
+`GET /api/ingestion/jobs/{id}`, cancel with DELETE, and retry a transient failure
+with `POST /api/ingestion/jobs/{id}/retry`. Authorization and same-origin controls
+apply. Sources are bounded by actual bytes, not just Content-Length.
+
+One isolated worker process handles extraction/chunking/embedding at a time. The
+queue accepts at most 32 outstanding jobs. `DOCATLAS_INGESTION_TIMEOUT` defaults to
+180 seconds; `DOCATLAS_WORKER_MEMORY_MB` defaults to 1024 MB. The parent monitors
+RSS every 0.5 seconds on Linux/macOS and terminates an over-budget worker. This
+is sampling, not a hard memory allocation cap or security sandbox. Increase the
+budget explicitly for larger embedding models after measuring memory use.
+
+Stages are persisted, not invented percentages. A restart requeues interrupted
+work, with at most three attempts. Replacement indexes and ready job state share
+one transaction; cancellation before that transaction preserves the old document.
+Ready/invalid/cancelled sources are removed. Transient-failure sources are retained
+privately for seven days, then removed on startup/hourly cleanup. They never enter
+Git. Expired failures require re-upload rather than retry.
+
+Before the first extraction-profile schema migration, an existing database is
+backed up with SQLite's backup API to `data/backups/pre-mixed-v2.sqlite3`, mode 0600.
+Keep this backup private. Extraction profile participates in unchanged-content
+checks and corpus fingerprints, so re-ingestion upgrades legacy documents. Job
+metadata and extraction warnings persist in SQLite.
+
+`GET /api/readiness` requires workspace authorization and checks SQLite quick_check,
+chunk/FTS counts and missing index entries. It reports model testing separately
+from the explicitly uncertified answer quality. A degraded index returns 503.
+
+The legacy `POST /api/documents` and CLI ingest remain synchronous for compatibility;
+use browser jobs for process isolation/recovery. Do not mix CLI writes with a live
+worker or run multiple replicas. A second ingestion owner fails startup rather
+than stealing queued work. Docker packaging includes the worker modules but local
+container verification requires a running Docker engine.

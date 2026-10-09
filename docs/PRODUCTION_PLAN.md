@@ -47,7 +47,7 @@ Implemented and tested for local setup. Remote contracts have mock coverage;
 there is no live remote-provider verification or spend authorization. Local live
 answer-quality failures remain documented separately.
 
-## Phase 2 — Establish a real mixed-document corpus
+## Phase 2 — Establish a real mixed-document corpus (skipped by user)
 
 Why: a documentation-only fixture cannot reveal failures in reports, messy notes,
 scanned pages or conflicting versions.

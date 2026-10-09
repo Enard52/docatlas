@@ -48,3 +48,16 @@ Source/quote validation establishes that quoted text was supplied to the model.
 It does not establish semantic support, truth or immunity to prompt injection.
 Live local tests demonstrated unsupported claims with valid quotations. Generated
 responses are labeled drafts and need evidence inspection.
+
+## Ingestion process boundaries
+
+Background uploads use private 0600 spool files under a 0700 directory, a persistent
+SQLite queue, and a single isolated worker process. The parent owns cancellation,
+wall-time limits and sampled RSS limits. Isolation prevents parser work from sharing
+the API process; it does not sandbox filesystem/network access or contain a library
+exploit. Workers run as the same OS account. Use trusted local work documents, keep
+the deployment local, and apply OS/container restrictions before accepting arbitrary
+untrusted uploads from other users. Original source files for retryable failures
+remain private for up to seven days; completed/invalid/cancelled sources are removed.
+The worker receives no generation/workspace key environment variables, but its
+filesystem permissions still permit access to that account's data directory.

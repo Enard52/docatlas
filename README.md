@@ -2,11 +2,13 @@
 
 **Documentation answers with evidence you can inspect.**
 
-DocAtlas ingests Markdown, text, HTML and text-based PDFs; searches with BM25,
+DocAtlas ingests Markdown, text, HTML, DOCX and text-based PDFs; searches with BM25,
 local neural embeddings or hybrid rank fusion; and optionally synthesizes answers
 through an OpenAI-compatible model. Every generated claim must reference a retrieved
 passage and include a quote verified against that passage. The browser workspace
-includes a document library, source inspection, retrieval comparison and system metrics.
+includes durable upload jobs, a filterable document library, source inspection,
+answer/source export, retrieval comparison and system metrics. The browser defaults
+to fast source excerpts; model drafts are an explicit option.
 
 ![DocAtlas workspace](docs/workspace.png)
 
@@ -42,7 +44,10 @@ pip install -c requirements.lock '.[dev,semantic]'
 docatlas serve
 ```
 
-Open **http://127.0.0.1:8000**. Upload your documents in the library. The app works
+Open **http://127.0.0.1:8000**. Upload your documents in the library. Jobs persist
+across refreshes and restarts; failed replacements preserve the previous index.
+DOCX tables are flattened by row, and PDF extraction warnings identify sparse pages;
+scanned PDFs still need OCR before upload. See [production progress](docs/PRODUCTION_PROGRESS.md). The app works
 without an API key in explicitly labeled evidence mode: it returns real retrieved
 passages, not fabricated model responses.
 
