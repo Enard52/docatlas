@@ -2,34 +2,18 @@
 
 **Documentation answers with evidence you can inspect.**
 
-DocAtlas ingests Markdown, text, HTML, DOCX and text-based PDFs; searches with BM25,
-local neural embeddings or hybrid rank fusion; and optionally synthesizes answers
-through an OpenAI-compatible model. Every generated claim must reference a retrieved
-passage and include a quote verified against that passage. The browser workspace
-includes durable upload jobs, a filterable document library, source inspection,
-answer/source export, retrieval comparison and system metrics. The browser defaults
-to fast source excerpts; model drafts are an explicit option.
+Search your documents, inspect the supporting passages, and optionally generate
+cited draft answers. DocAtlas runs locally and works without a model API key.
+
+- Import Markdown, text, HTML, DOCX and text-based PDFs.
+- Search with BM25 by default; optionally use local neural or hybrid retrieval.
+- Inspect sources, track upload jobs and export evidence in the browser workspace.
+- Evaluate retrieval changes against a versioned development dataset.
+
+[Quick start](docs/QUICKSTART.md) · [Contribute](CONTRIBUTING.md) ·
+[Good first issues](https://github.com/nymav/docatlas/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
 
 ![DocAtlas workspace](docs/workspace.png)
-
-## Measured, not assumed
-
-A local development evaluation over **12 public FastAPI pages, 223 passages and 30
-AI-authored questions** produced the following results at k=5:
-
-| Method | Evidence recall@5 | MRR@5 | Out-of-corpus abstention |
-|---|---:|---:|---:|
-| BM25 | 0.9583 | 0.8090 | 1.0000 |
-| Neural | 0.8750 | 0.7896 | 0.6667 |
-| Hybrid | 0.9583 | 0.7986 | 0.6667 |
-
-**Interpretation:** hybrid did not outperform BM25 on this small, terminology-heavy
-development set. Neural retrieval reduced false abstentions on answerable questions,
-but accepted two personal-data questions that the public corpus could not answer.
-The default installation therefore starts with BM25; enable neural/hybrid explicitly
-and evaluate it on your own corpus. See [full results](evals/development-results.md)
-and [evaluation limitations](evals/README.md). These figures are not generated-answer
-accuracy, a human-reviewed benchmark, or a production SLA.
 
 ## Run locally
 
@@ -40,7 +24,7 @@ git clone https://github.com/nymav/docatlas.git
 cd docatlas
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -c requirements.lock '.[dev,semantic]'
+python -m pip install -c requirements.lock .
 docatlas serve
 ```
 
@@ -65,6 +49,16 @@ docatlas serve
 The fetcher downloads only the public, revision-pinned FastAPI corpus and verifies
 checksums. Its documentation may contain unexpanded upstream code-include directives;
 the development questions target text passages rather than omitted source snippets.
+
+## Technology stack
+
+Python 3.11+ · FastAPI / Uvicorn · SQLite FTS5 · NumPy · vanilla JavaScript.
+Optional FastEmbed provides local ONNX embeddings. Optional generation uses a
+configured OpenAI-compatible provider. See [architecture](#architecture-and-decisions).
+
+For a first question with a bundled fictional document, follow the
+[guided walkthrough](docs/QUICKSTART.md). For development dependencies and checks,
+see [contributing](CONTRIBUTING.md).
 
 ## Connect a model
 
@@ -108,6 +102,25 @@ all claims and quotes for meaning before counting a quality pass.
 
 `.env.example` documents supported environment variables. The Python CLI reads the
 process environment; it does **not** automatically load `.env`. Docker Compose does.
+
+## Measured, not assumed
+
+A local development evaluation over **12 public FastAPI pages, 223 passages and 30
+AI-authored questions** produced the following results at k=5:
+
+| Method | Evidence recall@5 | MRR@5 | Out-of-corpus abstention |
+|---|---:|---:|---:|
+| BM25 | 0.9583 | 0.8090 | 1.0000 |
+| Neural | 0.8750 | 0.7896 | 0.6667 |
+| Hybrid | 0.9583 | 0.7986 | 0.6667 |
+
+**Interpretation:** hybrid did not outperform BM25 on this small, terminology-heavy
+development set. Neural retrieval reduced false abstentions on answerable questions,
+but accepted two personal-data questions that the public corpus could not answer.
+The default installation therefore starts with BM25; enable neural/hybrid explicitly
+and evaluate it on your own corpus. See [full results](evals/development-results.md)
+and [evaluation limitations](evals/README.md). These figures are not generated-answer
+accuracy, a human-reviewed benchmark, or a production SLA.
 
 ## Evaluate and prevent regressions
 
@@ -173,3 +186,16 @@ flowchart LR
 
 See [operations](docs/OPERATIONS.md), [security](SECURITY.md), and the
 [release acceptance criteria](docs/RELEASE_SCOPE.md).
+
+
+## Help improve DocAtlas
+
+Try the quick start and tell us which step was unclear. Use the onboarding feedback
+issue form; a fresh perspective is useful. Small documentation improvements and
+focused regression tests are welcome. Read [contributing](CONTRIBUTING.md) and the
+[code of conduct](CODE_OF_CONDUCT.md) before opening a PR.
+
+## License
+
+DocAtlas is distributed under the [MIT license](LICENSE). Dependencies and the
+public evaluation corpus retain their own licenses; see [corpus details](evals/README.md).

@@ -1,0 +1,33 @@
+name: Bug report
+description: Report a reproducible problem using sample data.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not attach private documents, API keys or database files. See SECURITY.md for sensitive reports.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Explain actual and expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include commands or browser steps and a minimal fictional sample if needed.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python version, commit/version, browser and retrieval/provider mode. Redact secrets.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs or screenshots
+      description: Remove document contents, credentials and personal information.

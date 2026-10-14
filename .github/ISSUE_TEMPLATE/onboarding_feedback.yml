@@ -1,0 +1,23 @@
+name: Onboarding feedback
+description: Help improve the first-run or contributor experience.
+labels: [documentation]
+body:
+  - type: textarea
+    id: step
+    attributes:
+      label: Where did you get stuck?
+      description: Link the documentation section and include your OS/Python version.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected versus actual result
+      description: Explain what you tried. Do not include secrets or private documents.
+    validations:
+      required: true
+  - type: textarea
+    id: improvement
+    attributes:
+      label: What would have helped?
+      description: A missing explanation, example, command or screenshot?
