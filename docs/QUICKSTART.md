@@ -45,6 +45,13 @@ content is fictional. Replace it with documents you are permitted to process.
   semantic extra and configure `DOCATLAS_EMBEDDINGS=fastembed` before ingestion if needed.
 - **Unexpected settings:** `.env` is not automatically loaded by the Python CLI.
   Docker Compose loads it. Saved provider settings take precedence over environment settings.
+- **Unintended document replacement:** DocAtlas uses the filename as document identity.
+  Uploading changed content under an existing filename (such as updating `handbook.md`)
+  replaces that document's index rather than creating a separate source. To retain both
+  documents as distinct search targets, give them distinct filenames (for example,
+  `handbook-team-a.md` and `handbook-team-b.md`). Intentional updates should reuse the
+  existing filename to update the index atomically. See
+  [atomic ingestion in architecture](../README.md#architecture-and-decisions).
 
 See [contributing](../CONTRIBUTING.md) for development checks, [operations](OPERATIONS.md)
 for deployment, and [security](../SECURITY.md) before sharing a workspace.
